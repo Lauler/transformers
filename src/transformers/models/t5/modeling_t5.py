@@ -12,6 +12,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# split_tensor_along_last_dim() is from Nvidia Megatron-LM
+# with slight modifications. It has the following license:
+#
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """ PyTorch T5 model."""
 
 
@@ -22,6 +50,7 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+from einops import rearrange
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -489,6 +518,10 @@ class T5Attention(nn.Module):
             """reshape"""
             return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
 
+        def unshape_nemo(states):
+            """reshape"""
+            return states.transpose(0, 1).contiguous().view(-1, batch_size, self.inner_dim)
+
         def project(hidden_states, proj_layer, key_value_states, past_key_value):
             """projects hidden states correctly to key/query states"""
             if key_value_states is None:
@@ -516,6 +549,36 @@ class T5Attention(nn.Module):
                     hidden_states = past_key_value
             return hidden_states
 
+        def split_tensor_along_last_dim(
+            tensor,
+            num_partitions,
+            contiguous_split_chunks,
+        ):
+            """Split a tensor along its last dimension.
+
+            Arguments:
+                tensor: input tensor.
+                num_partitions: number of partitions to split the tensor
+                contiguous_split_chunks: If True, make each chunk contiguous
+                                        in memory.
+
+            Returns:
+                A list of Tensors
+            """
+            # Get the size and dimension.
+            last_dim = tensor.dim() - 1
+            assert tensor.size()[last_dim] % num_partitions == 0, "{} is not divisible by {}".format(
+                tensor.size()[last_dim], num_partitions
+            )
+            last_dim_size = tensor.size()[last_dim] // num_partitions
+            # Split.
+            tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+            # Note: torch.split does not create contiguous tensors by default.
+            if contiguous_split_chunks:
+                return tuple(chunk.contiguous() for chunk in tensor_list)
+
+            return tensor_list
+
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
@@ -527,10 +590,51 @@ class T5Attention(nn.Module):
             hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
         )
 
-        # compute scores
-        scores = torch.matmul(
-            query_states, key_states.transpose(3, 2)
-        )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+        query_states = rearrange(query_states, "b np sq hn -> sq b (np hn)")  # Like megatron
+        key_states = rearrange(key_states, "b np sk hn -> sk b (np hn)")  # Like megatron
+        value_states = rearrange(value_states, "b np sv hn -> sv b (np hn)")  # Like megatron
+
+        ## sq b n_heads dim_per_head -> sq b (n_heads dim_per_head)
+        # q_states2 = query_states.view(seq_length, batch_size, hidden_states.size(-1))
+        qkv_states = torch.cat([query_states, key_states, value_states], dim=-1)
+
+        # [sq, b, (3 * n_heads * dim_per_head)] -> [sq, b, n_heads, 3 * dim_per_head]
+        new_tensor_shape = qkv_states.size()[:-1] + (
+            self.n_heads,
+            3 * self.key_value_proj_dim,
+        )
+
+        qkv_states = qkv_states.view(new_tensor_shape)
+
+        query_layer, key_layer, value_layer = split_tensor_along_last_dim(qkv_states, 3, contiguous_split_chunks=True)
+
+        # key_states_temp = torch.cat(torch.split(key_states, 4, dim=1), dim=-1)
+        # value_states_temp = torch.cat(torch.split(value_states, 4, dim=1), dim=-1)
+
+        query_layer = rearrange(query_layer, "sq b np hn -> (b np) sq hn")
+        key_layer = rearrange(key_layer, "sk b np hn -> (b np) hn sk")
+        value_layer = rearrange(value_layer, "sv b np hn -> (b np) sv hn")
+
+        # We want the matmul to be the size of ((batch_size * self.n_heads), seq_length, key_length)).
+        matmul_input_buffer = torch.empty(
+            (query_layer.size(0), query_layer.size(1), key_layer.size(2)),
+            dtype=query_layer.dtype,
+            device=query_layer.device,
+        )
+
+        norm_factor = self.key_value_proj_dim**0.5  # sqrt(d_k)
+        # Calculate scores with baddmm
+        scores = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer,
+            key_layer,
+            out=matmul_input_buffer,
+            beta=0.0,
+            alpha=(1.0 / norm_factor),  # 1 / sqrt(d_k)
+        )
+
+        # Change view to [batch_size, self.n_heads, seq_length, key_length]
+        scores = scores.view(batch_size, self.n_heads, query_layer.size(1), key_layer.size(2))
 
         if position_bias is None:
             if not self.has_relative_attention_bias:
@@ -569,8 +673,27 @@ class T5Attention(nn.Module):
         if layer_head_mask is not None:
             attn_weights = attn_weights * layer_head_mask
 
-        attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
-        attn_output = self.o(attn_output)
+        # change view [b * np, sq, sk]
+        attn_weights = rearrange(attn_weights, "b n_heads sq sk -> (b n_heads) sq sk")
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attn_weights, value_layer)
+
+        # change view [b, np, sq, hn]
+        context_layer = rearrange(context_layer, "(b n_heads) sq hn -> b n_heads sq hn", n_heads=self.n_heads)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        context_layer = unshape_nemo(context_layer)
+        # attn_output = unshape(
+        #     torch.matmul(attn_weights, value_states)
+        # )  # (batch_size, seq_length, dim)
+        attn_output = self.o(context_layer)
+
+        # Back to [b, sq, d_model] because that's what we expect as hidden_states input
+        # the next time this attention layer is used.
+        attn_output = attn_output.permute(1, 0, 2).contiguous()
 
         present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
         outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
